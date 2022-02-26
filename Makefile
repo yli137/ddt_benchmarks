@@ -1,17 +1,31 @@
-TARGETS=alpha_normal_no_prefetch_pipeline alpha_normal_prefetch_pipeline alpha_prefetch_pipeline \
+TARGETS=alpha_normal_prefetch_pipeline
+#TARGETS+=alpha_normal_no_prefetch_pipeline  alpha_prefetch_pipeline \
 	alpha_pipeline_prefetch_pipeline alpha_pipeline_no_prefetch_pipeline
 
-OMPI_SRC = /Users/bosilca/unstable/ompi/ompi/ompi/
-OMPI_BIN = /Users/bosilca/unstable/ompi/ompi/build/fast
-CC = mpicc
-#CFLAGS = -O3 -I$(OMPI_SRC) -I$(OMPI_SRC)/opal/include -I$(OMPI_SRC)/ompi/include -I$(OMPI_BIN) -I$(OMPI_BIN)/opal/include
+INTERNAL_TARGETS=$(addsuffix ${MPI},$(TARGETS))
+
+ifeq ($(MPI),)
+MPI:=
+endif
+
+ifeq ($(ARGS),)
+ARGS:=
+endif
+
+ifeq "$(origin CC)" "default"
+CC := mpicc
+endif
+
 CFLAGS = -O3
 LDFLAGS = -O3
 
-all:$(TARGETS)
+all:$(INTERNAL_TARGETS)
 
-% : %.c common.h
+%${MPI} : %.c common.h
 	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $@
 
+check: all
+	$(foreach target,$(INTERNAL_TARGETS),./$(target) $(ARGS);)
+
 clean:
-	rm -f $(TARGETS)
+	rm -rf $(INTERNAL_TARGETS) *.o $(addsuffix .dSYM,$(TARGETS))
