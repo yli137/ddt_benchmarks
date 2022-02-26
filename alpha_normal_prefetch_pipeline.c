@@ -11,6 +11,7 @@
  */
 
 #include "common.h"
+#include <getopt.h>
 
 static int trash_tlb_n = 8;
 static int trash_disp[8] = {};
@@ -318,6 +319,7 @@ create_twice_two_doubles_every_eight(void)
 #define DO_VECTOR_2_2_8                   0x00000040
 #define DO_TLB_TRASH                      0x00000080
 #define DO_3_1_8                          0x00000100
+#define DO_3_1_2                          0x00000200
 
 #define DO_PACK                         0x01000000
 #define DO_PACK_PIPELINE                0x02000000
@@ -328,12 +330,29 @@ create_twice_two_doubles_every_eight(void)
 #define DO_IRECV_SEND                   0x40000000
 #define DO_IRECV_ISEND                  0x80000000
 
-#define MIN_LENGTH   1024
-#define MAX_LENGTH   8*(1024*1024)
+static struct {
+    char* name;
+    int value;
+} known_datatypes[] =
+    {
+        {.name = "contig",           .value = DO_CONTIG},
+        {.name = "const_gap",        .value = DO_CONSTANT_GAP},
+        {.name = "index_gap",        .value = DO_INDEXED_GAP},
+        {.name = "opt_index_gap",    .value = DO_OPTIMIZED_INDEXED_GAP},
+        {.name = "struct_const_gap", .value = DO_STRUCT_CONSTANT_GAP_RESIZED},
+        {.name = "struct_merged",    .value = DO_STRUCT_MERGED_WITH_GAP_RESIZED},
+        {.name = "v2_2_8",           .value = DO_VECTOR_2_2_8},
+        {.name = "tlb_trash",        .value = DO_TLB_TRASH},
+        {.name = "v3_1_8",           .value = DO_3_1_8},
+        {.name = "v3_1_2",           .value = DO_3_1_2},
+        {.name = NULL,               .value = 0},
+    };
 
 static int cycles  = 10;
 static int trials  = 10;
 static int warmups = 2;
+static int MIN_LENGTH = 1024;
+static int MAX_LENGTH = 8*1024*1024;
 
 static void print_result( size_t length, int trials, double* timers )
 {
@@ -615,13 +634,74 @@ static int matrix_unpack( int doop, MPI_Datatype sddt, MPI_Datatype rddt, size_t
     return 0;
 }
 
+static int verbose_flag = 0;
+static struct option long_options[] =
+        {
+          {"verbose",   no_argument,       &verbose_flag,  1},
+          {"help",      no_argument,       NULL,          'h'},
+          {"pack",      no_argument,       0,             'p'},
+          {"unpack",    no_argument,       0,             'u'},
+          {"pipeline",  required_argument, 0,             'd'},
+          {"type",      required_argument, 0,             't'},
+          {0, 0, 0, 0}
+        };
+
 int main( int argc, char* argv[] )
 {
-    int run_tests = DO_VECTOR_2_2_8 | DO_3_1_8 | DO_TLB_TRASH;  /* do all datatype tests by default */
-    int rank, size;
+    int c, rank, size, option_index = 0;
+    int run_tests = 0;  /* do nothing until we parse the arguments */
     MPI_Datatype ddt;
 
-    run_tests |= DO_PACK | DO_UNPACK;
+    while(1) {
+        c = getopt_long (argc, argv, "hpud:t:",
+                         long_options, &option_index);
+
+        /* Detect the end of the options. */
+        if (c == -1) {
+            break;
+        }
+        switch(c) {
+            case 0:
+            case 'h':
+                printf("Possible values for -t|--type are: ");
+                for(c = 0; NULL != known_datatypes[c].name; c++ ) {
+                    printf("%s%s", (0 == c ? "" : ","), known_datatypes[c].name);
+                }
+                printf("\n");
+                exit(0);
+            case 'p':
+                run_tests |= DO_PACK; break;
+            case 'u':
+                printf("Option -u is ignored for now\n");
+                run_tests |= DO_UNPACK; break;
+            case 'd':
+                printf("Option -d|--pipeline is ignored for now");
+            case 't':
+                {
+                    char* token = optarg;
+                    while( NULL != token ) {
+                        for(c = 0; NULL != known_datatypes[c].name; c++ ) {
+                            if( 0 == strncmp(known_datatypes[c].name,token, strlen(known_datatypes[c].name)) ) {
+                                run_tests |= known_datatypes[c].value;
+                                break;
+                            }
+                        }
+                        if( NULL == known_datatypes[c].name ) {
+                            printf("type %s unknown\n", token);
+                        }
+                        token = strstr(token, ",");
+                        if( NULL != token ) token++;
+                    }
+                }
+                break;
+            default:
+                exit(-1);
+        }
+    }
+    if( 0 == run_tests) {
+        run_tests  = DO_PACK | DO_UNPACK;
+        run_tests |= DO_VECTOR_2_2_8 | DO_3_1_2 | DO_3_1_8 | DO_TLB_TRASH;
+    }
 
     MPI_Init (&argc, &argv);
 
@@ -633,8 +713,22 @@ int main( int argc, char* argv[] )
         exit(0);
     }
 
+    if( run_tests & DO_3_1_2) {
+        printf("\n! 3 doubles 1 next cache line resized 2 cache lines\n\n");
+        int blen2[] = { 3, 1 };
+        int disp2[] = { 0, 8 };
+        MPI_Type_indexed( 2, blen2, disp2, MPI_DOUBLE, &ddt );
+        MPI_Type_create_resized( ddt, 0, 64 * 2, &ddt );
+        MPI_Type_commit( &ddt );
+
+        do_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH );
+        do_pipeline_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH,
+                                  three_next_n, &(three_disp[0]),
+                                  &(three_len[0]), &(three_dst_disp[0]) );
+        MPI_Type_free( &ddt );
+    }
     if( run_tests & DO_3_1_8) {
-        printf("\n! 3 doubles 1 next cache line\n\n");
+        printf("\n! 3 doubles 1 next cache line resized 8 cache lines\n\n");
         int blen2[] = { 3, 1 };
         int disp2[] = { 0, 8 };
         MPI_Type_indexed( 2, blen2, disp2, MPI_DOUBLE, &ddt );
