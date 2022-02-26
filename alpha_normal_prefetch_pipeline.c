@@ -10,38 +10,7 @@
  * $HEADER$
  */
 
-#include "mpi.h"
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <math.h>
-
-#include "ompi/include/mpi.h"
-#include "ompi/datatype/ompi_datatype.h"
-
-#include "ompi_config.h"
-#include "ompi/mpi/c/bindings.h"
-#include "ompi/runtime/params.h"
-#include "ompi/communicator/communicator.h"
-#include "ompi/errhandler/errhandler.h"
-#include "opal/datatype/opal_convertor.h"
-#include "ompi/memchecker.h"
-
-#if 0 && OPEN_MPI
-extern void ompi_datatype_dump( MPI_Datatype ddt );
-#define MPI_DDT_DUMP(ddt) ompi_datatype_dump( (ddt) )
-#else
-#define MPI_DDT_DUMP(ddt)
-#endif  /* OPEN_MPI */
-
-#define L1size sysconf(_SC_LEVEL1_DCACHE_SIZE)
-#define L2size sysconf(_SC_LEVEL2_CACHE_SIZE)
-#define L3size sysconf(_SC_LEVEL3_CACHE_SIZE)
-void cache_flush(){
-    char *cache = (char*)calloc(L1size+L2size+L3size, sizeof(char));
-    free(cache);
-}
+#include "common.h"
 
 static int trash_tlb_n = 8;
 static int trash_disp[8] = {};
@@ -53,13 +22,36 @@ static int three_disp[2] = {0, 64};
 static int three_len[2] = {24, 8};
 static int three_dst_disp[2] = {0, 24};
 
+static struct cache_cleanup_s {
+  int* memory;
+  size_t length;
+} cache_cleanup = { .memory = NULL, .length = 0};
+
+static int cache_flush(void)
+{
+    int res = 0;
+    if( NULL == cache_cleanup.memory ) {
+        cache_cleanup.length = L1size + L2size + L3size + Lcachelinesize;
+        cache_cleanup.memory = (int*)calloc(cache_cleanup.length/sizeof(int), sizeof(int));
+        if( NULL == cache_cleanup.memory ) {
+            return 0;
+        }
+    }
+    /* We only need to force each cache line to be loaded */
+    for( int i = 0; i < cache_cleanup.length; i += (Lcachelinesize / sizeof(int))) {
+        res += cache_cleanup.memory[i];
+    }
+    return res;
+}
+
+
 static MPI_Datatype
 create_random_indexed( int count, int blen, int stride, MPI_Datatype dt, int seed )
 {
     MPI_Datatype ddt;
     int indices[count], block[count];
 
-    size_t extent, lb;
+    MPI_Aint extent, lb;
     MPI_Type_get_extent( dt, &lb, &extent );
 
     srand(seed);
@@ -304,7 +296,16 @@ create_indexed_gap_optimized_ddt( void )
     return dt3;
 }
 
+static MPI_Datatype
+create_twice_two_doubles_every_eight(void)
+{
+    MPI_Datatype dt;
 
+    MPI_Type_vector(2, 2, 4, MPI_DOUBLE, &dt);
+
+    MPI_Type_commit(&dt);
+    return dt;
+}
 /********************************************************************
  *******************************************************************/
 
@@ -314,20 +315,25 @@ create_indexed_gap_optimized_ddt( void )
 #define DO_OPTIMIZED_INDEXED_GAP          0x00000008
 #define DO_STRUCT_CONSTANT_GAP_RESIZED    0x00000010
 #define DO_STRUCT_MERGED_WITH_GAP_RESIZED 0x00000020
+#define DO_VECTOR_2_2_8                   0x00000040
+#define DO_TLB_TRASH                      0x00000080
+#define DO_3_1_8                          0x00000100
 
 #define DO_PACK                         0x01000000
-#define DO_UNPACK                       0x02000000
-#define DO_ISEND_RECV                   0x04000000
-#define DO_ISEND_IRECV                  0x08000000
-#define DO_IRECV_SEND                   0x10000000
-#define DO_IRECV_ISEND                  0x20000000
+#define DO_PACK_PIPELINE                0x02000000
+#define DO_UNPACK                       0x04000000
+#define DO_UNPACK_PIPELINE              0x08000000
+#define DO_ISEND_RECV                   0x10000000
+#define DO_ISEND_IRECV                  0x20000000
+#define DO_IRECV_SEND                   0x40000000
+#define DO_IRECV_ISEND                  0x80000000
 
 #define MIN_LENGTH   1024
-#define MAX_LENGTH   1024*(1024*1024)
+#define MAX_LENGTH   8*(1024*1024)
 
 static int cycles  = 10;
 static int trials  = 10;
-static int warmups = 0;
+static int warmups = 2;
 
 static void print_result( size_t length, int trials, double* timers )
 {
@@ -405,7 +411,7 @@ static int do_pipeline_pack( const void *inbuf, int incount, MPI_Datatype dataty
 {
     int position, myself, c, t, i, ddt_size;
     double timers[trials];
-    size_t extent, lb;
+    MPI_Aint extent, lb;
 
     int hold_incount = incount;
     int pref_count = incount;
@@ -508,22 +514,21 @@ static int do_test_for_ddt( int doop, MPI_Datatype sddt, MPI_Datatype rddt, size
 {
     MPI_Aint lb, extent;
     char *sbuf, *rbuf;
-    int i;
-    int max_length;
+    int i, type_length;
 
     MPI_Type_get_extent( sddt, &lb, &extent );
-    MPI_Type_size( sddt, &max_length );
-
-    length = 100000000. / max_length * extent;
+    MPI_Type_size( sddt, &type_length );
 
     sbuf = (char*)malloc( length );
     rbuf = (char*)malloc( length );
-
 
     if( doop & DO_PACK ) {
         printf("# Pack (max length %zu)\n", length);
         for( i = 1; i < (length / extent); i*=2  ) {
             pack( cycles, sddt, i, sbuf, rbuf );
+        }
+        if( i != (length / extent)) {
+            pack(cycles, sddt, length / extent, sbuf, rbuf);
         }
     }
 
@@ -537,32 +542,20 @@ static int do_pipeline_test_for_ddt( int doop, MPI_Datatype sddt, MPI_Datatype r
 {
     MPI_Aint lb, extent;
     char *sbuf, *rbuf;
-    int i;
-    int max_length;
+    int i, type_length;
 
     MPI_Type_get_extent( sddt, &lb, &extent );
-    MPI_Type_size( sddt, &max_length );
-
-    length = 100000000. / max_length * extent;
+    MPI_Type_size( sddt, &type_length );
 
     sbuf = (char*)malloc( length );
     rbuf = (char*)malloc( length );
 
-    printf("\n# Pack (max length %zu) Pipeline FULL ddt per segment\n",
-            length,
-            length / extent);
+    if( doop & DO_PACK_PIPELINE ) {
+        printf("\n# Pack (length %zu, fragment %zu) Pipeline FULL ddt per segment\n",
+                length, length / extent);
 
-    for( i = 1; i < (length / extent); i*=2 ){
-        pack_pipeline( cycles, sddt, i, sbuf, rbuf, i,
-                num, disp, len, dst_disp );
-    }
-
-    for( int j = 1; j < 513; j *= 2 ){
-        printf("\n# Pack (max length %zu) Pipeline %d ddt per segment\n", 
-                length,
-                j);
-        for( i = j; i < (length / extent); i*=2  ) {
-            pack_pipeline( cycles, sddt, i, sbuf, rbuf, j,
+        for( i = 1; i < (length / extent); i*=2 ){
+            pack_pipeline( cycles, sddt, i, sbuf, rbuf, i,
                            num, disp, len, dst_disp );
         }
     }
@@ -624,7 +617,7 @@ static int matrix_unpack( int doop, MPI_Datatype sddt, MPI_Datatype rddt, size_t
 
 int main( int argc, char* argv[] )
 {
-    int run_tests = 0xffff;  /* do all datatype tests by default */
+    int run_tests = DO_VECTOR_2_2_8 | DO_3_1_8 | DO_TLB_TRASH;  /* do all datatype tests by default */
     int rank, size;
     MPI_Datatype ddt;
 
@@ -640,31 +633,46 @@ int main( int argc, char* argv[] )
         exit(0);
     }
 
-    printf("\n! 3 doubles 1 next cache line\n\n");
-    int blen2[] = { 3, 1 };
-    int disp2[] = { 0, 8 };
-    MPI_Type_indexed( 2, blen2, disp2, MPI_DOUBLE, &ddt );
-    MPI_Type_create_resized( ddt, 0, 64 * 8, &ddt );
-    MPI_Type_commit( &ddt );
+    if( run_tests & DO_3_1_8) {
+        printf("\n! 3 doubles 1 next cache line\n\n");
+        int blen2[] = { 3, 1 };
+        int disp2[] = { 0, 8 };
+        MPI_Type_indexed( 2, blen2, disp2, MPI_DOUBLE, &ddt );
+        MPI_Type_create_resized( ddt, 0, 64 * 8, &ddt );
+        MPI_Type_commit( &ddt );
 
-    do_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH );
-    do_pipeline_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH,
-                              three_next_n, &(three_disp[0]),
-                              &(three_len[0]), &(three_dst_disp[0]) );
-    MPI_Type_free( &ddt );
+        do_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH );
+        do_pipeline_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH,
+                                  three_next_n, &(three_disp[0]),
+                                  &(three_len[0]), &(three_dst_disp[0]) );
+        MPI_Type_free( &ddt );
+    }
 
-    printf("\n! Trashing TLB datatype\n\n");
-    int disp5[] = { 0, 4096, 8, 4104, 16, 4112, 24, 4120 };
-    int blen5[] = { 1, 1, 1, 1, 1, 1, 1, 1 };
-    MPI_Type_indexed( 8, blen5, disp5, MPI_DOUBLE, &ddt );
-    MPI_Type_create_resized( ddt, 0, 8192, &ddt );
-    MPI_Type_commit( &ddt );
+    if( run_tests & DO_VECTOR_2_2_8 ) {
+        printf("\n! 2 times 2 doubles every 8 \n\n");
+        ddt = create_twice_two_doubles_every_eight();
 
-    do_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH );
-    do_pipeline_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH,
-                              trash_tlb_n, &(trash_disp[0]),
-                              &(trash_len[0]), &(trash_dst_disp[0]) );
-    MPI_Type_free( &ddt );
+        do_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH );
+        do_pipeline_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH,
+                                  three_next_n, &(three_disp[0]),
+                                  &(three_len[0]), &(three_dst_disp[0]) );
+        MPI_Type_free( &ddt );
+    }
+
+    if( run_tests & DO_TLB_TRASH) {
+        printf("\n! Trashing TLB datatype\n\n");
+        int disp5[] = { 0, 4096, 8, 4104, 16, 4112, 24, 4120 };
+        int blen5[] = { 1, 1, 1, 1, 1, 1, 1, 1 };
+        MPI_Type_indexed( 8, blen5, disp5, MPI_DOUBLE, &ddt );
+        MPI_Type_create_resized( ddt, 0, 8192, &ddt );
+        MPI_Type_commit( &ddt );
+
+        do_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH );
+        do_pipeline_test_for_ddt( run_tests, ddt, ddt, MAX_LENGTH,
+                                  trash_tlb_n, &(trash_disp[0]),
+                                  &(trash_len[0]), &(trash_dst_disp[0]) );
+        MPI_Type_free( &ddt );
+    }
 
     MPI_Finalize();
     exit(0);

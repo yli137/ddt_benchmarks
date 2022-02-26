@@ -10,34 +10,8 @@
  * $HEADER$
  */
 
-#include "mpi.h"
+#include "common.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <math.h>
-
-#include "ompi/include/mpi.h"
-#include "ompi/datatype/ompi_datatype.h"
-
-#include "ompi_config.h"
-#include "ompi/mpi/c/bindings.h"
-#include "ompi/runtime/params.h"
-#include "ompi/communicator/communicator.h"
-#include "ompi/errhandler/errhandler.h"
-#include "opal/datatype/opal_convertor.h"
-#include "ompi/memchecker.h"
-
-#if 0 && OPEN_MPI
-extern void ompi_datatype_dump( MPI_Datatype ddt );
-#define MPI_DDT_DUMP(ddt) ompi_datatype_dump( (ddt) )
-#else
-#define MPI_DDT_DUMP(ddt)
-#endif  /* OPEN_MPI */
-
-#define L1size sysconf(_SC_LEVEL1_DCACHE_SIZE)
-#define L2size sysconf(_SC_LEVEL2_CACHE_SIZE)
-#define L3size sysconf(_SC_LEVEL3_CACHE_SIZE)
 void cache_flush(){
     char *cache = (char*)calloc(L1size+L2size+L3size, sizeof(char));
     free(cache);
@@ -59,7 +33,7 @@ create_random_indexed( int count, int blen, int stride, MPI_Datatype dt, int see
     MPI_Datatype ddt;
     int indices[count], block[count];
 
-    size_t extent, lb;
+    MPI_Aint extent, lb;
     MPI_Type_get_extent( dt, &lb, &extent );
 
     srand(seed);
@@ -405,7 +379,7 @@ static int do_pipeline_pack( const void *inbuf, int incount, MPI_Datatype dataty
 {
     int position, myself, c, t, i, ddt_size;
     double timers[trials];
-    size_t extent, lb;
+    MPI_Aint extent, lb;
 
     int hold_incount = incount;
     int pref_count = incount;
@@ -541,7 +515,7 @@ static int do_pipeline_test_for_ddt( int doop, MPI_Datatype sddt, MPI_Datatype r
     sbuf = (char*)malloc( length );
     rbuf = (char*)malloc( length );
 
-    printf("\n# Pack (max length %zu) Pipeline FULL ddt per segment\n",
+    printf("\n# Pack (length %zu, fragment %zu) Pipeline FULL ddt per segment\n",
             length,
             length / extent);
 
